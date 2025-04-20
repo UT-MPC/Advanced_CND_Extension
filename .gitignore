@@ -1,2 +1,14 @@
-Extended_Adv_simulatior/
-Extension_across_epoch_simulatior/
+# Default ignored files
+/shelf/
+/workspace.xml
+
+output/
+output_dc/
+*.class
+*.log
+
+# IDE
+.idea/
+*.iml
+
+.vscode
