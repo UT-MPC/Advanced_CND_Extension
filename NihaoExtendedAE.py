@@ -26,127 +26,193 @@ I_secB = 7.98
 L_Scan = A - B  ##Extended Nihao
 
 sla_prob_list = [0.70, 0.80, 0.90]  # Desired probability of discovery
-latency_list = [10000, 30000] 
+latency_list = [30000, 10000] 
 sla_node_set = [3, 10, 25, 50, 75, 100]  # Set of nodes to test
 
 n_chunk_list = [1, 2, 3]
 
 # Function to compute the energy cost of one epoch given this schedule
-def compute_Q(adv_interval, num_beacons, psi, E):
+def compute_Q(adv_interval, num_beacons, E):
     idletime = E - L_Scan - (b * num_beacons)
     return (I_rx * L_Scan + num_beacons * (b * I_tx) + idletime * I_idle) / E
 
+def cal_frac(L1, L2, Pd_one):
+    frac_start, frac_end = (L1-B)/(L_Scan-B), (L2-B)/(L_Scan-B)
+    frac_start, frac_end = max(frac_start, 0), max(frac_end, 0)
+    return frac_start+frac_end, frac_start*frac_end # single, both
 
-def compute_n_probability(lat, window, n_target):
-    if n_target<=0: 
-        return 0
-    if window==0: 
-        return 0
+def pdf_irwin_hall(x, k, W):
+    if x < 0 or x > k*W:
+        return 0.0
+    m = math.floor(x/W)
+    acc = 0.0
+    for j in range(m + 1):
+        acc += (-1)**j * math.comb(k, j) * (x - j*W)**(k-1)
+    return acc / (math.factorial(k-1) * W**k)
 
-    # Expected length of one segment
-    mean_L = 1.5 * window
-    var_L = window**2 / 12  # Variance of a uniform distribution U[window, 2*window]
-    std_L = (var_L ** 0.5)  # Standard deviation of L
+def combK(latency: int, k: int, W_base: int, Pd_one) -> float:
+    if latency==0:
+        return 0, 0, 0
 
-    # Total mean and standard deviation of the sum of n_target segments
-    mean_total = n_target * mean_L
-    std_total = (n_target * var_L) ** 0.5
+    l_start = 2*W_base
 
-    # Calculate boundaries for n_target segments
-    lower_bound = lat - (n_target + 1) * mean_L
-    upper_bound = lat - n_target * mean_L
+    def integrand_totalComb(start):
+        lat = max(0, latency - start)
+        
+        start_comb = min(W_base, l_start-start)
+        P_valid_start = start_comb / (W_base**2 * 3/2)
 
-    # Standardize bounds
-    z_lower = lower_bound / std_total
-    z_upper = upper_bound / std_total
+        nonL = (W_base-A)
+        L_max = L_Scan if start-nonL>=L_Scan else max(0, start-nonL) ###
+        diff = min(L_max, max(0,start_comb-B))
+        L_min = L_max-diff
+        L_start = (L_max+L_min)*diff/2 / start_comb if start_comb else 0
 
-    # Compute probability using normal CDF
-    return norm.cdf(z_upper) - norm.cdf(z_lower)
+        def integrand_P(res):
+            s = lat - res
+            P_res = 1 if res <= W_base else (2*W_base - res)/W_base
+            return pdf_irwin_hall(s, k, W_base) * P_res
 
+        # edge case
+        if k==0:
+            res = lat
+            if res>2*W_base: 
+                return 0
+            P_valid_end = 1 if res <= W_base else (2*W_base - res)/W_base
+            return P_valid_start * P_valid_end
+        
+        P_valid_end, _ = quad(integrand_P, 0, min(lat, 2*W_base))
+        return P_valid_start * P_valid_end
 
-def compute_disc_prob(A, i, E, nb, C, psiGap, minN, W_base, latency):
-    global n 
+    def integrand_frac_single(start):
+        lat = max(0, latency - start)
 
-    Window = W_base + W_base/2
+        start_comb = min(W_base, l_start-start)
+        P_valid_start = start_comb / (W_base**2 * 3/2)
 
-    P_oneW = compute_disc_from_lat(A, nb, C, E, psiGap, lat=Window*(2/3), window=Window, W_base=W_base)  ###
+        nonL = (W_base-A)
+        L_max = L_Scan if start-nonL>=L_Scan else max(0, start-nonL)
+        diff = min(L_max, max(0,start_comb-B)) 
+        L_min = L_max-diff
+        L_start = (L_max+L_min)*diff/2 / start_comb if start_comb else 0
+        
+        def integrand_P(res):
+            s = lat - res
+            P_res = 1 if res <= W_base else (2*W_base - res)/W_base
+            L_end = L_Scan if res >= A else max(0, res-B) ### DIFF FROM BLEND
+            frac_single, _ = cal_frac(L_start, L_end, Pd_one)
+            return pdf_irwin_hall(s, k, W_base) * P_res * frac_single
+        
+        # edge case
+        if k==0:
+            res = lat
+            if res>2*W_base: 
+                return 0
+            P_valid_end = 1 if res <= W_base else (2*W_base - res)/W_base
+            L_end = L_Scan if res >= A else max(0, res-B) ### DIFF FROM BLEND
+            frac_single, _ = cal_frac(L_start, L_end, Pd_one)
+            return P_valid_start * P_valid_end * frac_single
+        else:
+            weighted_frac_single, _ = quad(integrand_P, 0, min(lat, 2*W_base))
+            return P_valid_start * weighted_frac_single
+    
+    def integrand_frac_both(start):
+        lat = max(0, latency - start)
 
-    Pd_total = 0
-    cnt = 0
+        start_comb = min(W_base, l_start-start)
+        P_valid_start = start_comb / (W_base**2 * 3/2)
 
-    for start in range(min(int(Window), latency)):
+        nonL = (W_base-A)
+        L_max = L_Scan if start-nonL>=L_Scan else max(0, start-nonL)
+        diff = min(L_max, max(0,start_comb-B)) 
+        L_min = L_max-diff
+        L_start = (L_max+L_min)*diff/2 / start_comb if start_comb else 0
+        
+        def integrand_P(res):
+            s = lat - res
+            P_res = 1 if res <= W_base else (2*W_base - res)/W_base
+            L_end = L_Scan if res >= A else max(0, res-B) ### DIFF FROM BLEND
+            _, frac_both = cal_frac(L_start, L_end, Pd_one)
+            return pdf_irwin_hall(s, k, W_base) * P_res * frac_both
 
-        Pd = 0
-        Pd_minus = 0
-        Pd_plus = 0
+        # edge case
+        if k==0:
+            res = lat
+            if res>2*W_base: 
+                return 0
+            P_valid_end = 1 if res <= W_base else (2*W_base - res)/W_base
+            L_end = L_Scan if res >= A else max(0, res-B) ### DIFF FROM BLEND
+            _, frac_both = cal_frac(L_start, L_end, Pd_one)
+            return P_valid_start * P_valid_end * frac_both
+        else:
+            weighted_frac_both, _ = quad(integrand_P, 0, min(lat, 2*W_base))
+            return P_valid_start * weighted_frac_both
+    
 
-        n = math.floor((latency-start)/Window)
+    totalComb, _ = quad(integrand_totalComb, 0, l_start)
+    integral_frac_single, _ = quad(integrand_frac_single, 0, l_start)
+    integral_frac_both, _ = quad(integrand_frac_both, 0, l_start)
 
-        Pn = compute_n_probability(latency-start, W_base, n)
-        Pn_minus = compute_n_probability(latency-start, W_base, n-1)
-        Pn_plus = compute_n_probability(latency-start, W_base, n+1)
+    frac_single = integral_frac_single / totalComb if totalComb else 0
+    frac_both = integral_frac_both / totalComb if totalComb else 0
+    return totalComb, frac_single, frac_both
 
-        res = (latency - start - Window*n) ###
-
-        for i in range(minN, n+1):
-            Pd += math.comb(n,i) * (P_oneW**i) * (1-P_oneW)**(n-i)
-        for i in range(minN, n-1+1):
-            Pd_minus += math.comb(n-1,i) * (P_oneW**i) * (1-P_oneW)**(n-1-i)
-        for i in range(minN, n+1+1):
-            Pd_plus += math.comb(n+1,i) * (P_oneW**i) * (1-P_oneW)**(n+1-i)
-
-        lat_start = max(0, start-W_base/2)
-        lat_start = (lat_start//A) * A
-        P_start = compute_disc_from_lat(A, nb, C, E, psiGap, lat=max(0, lat_start), window=Window, W_base=W_base)
-
-        lat_res = (res//A + 1) * A
-        P_res = compute_disc_from_lat(A, nb, C, E, psiGap, lat=min(lat_res, W_base), window=Window, W_base=W_base) ###
-
-        if n>=minN-1>=0:
-            Pd += math.comb(n,minN-1) * P_oneW**(minN-1) * (1-P_oneW)**(n-minN+1) * (P_res+P_start - P_start*P_res)
-        if n-1>=minN-1>=0:
-            Pd_minus += math.comb(n-1,minN-1) * P_oneW**(minN-1) * (1-P_oneW)**(n-1-minN+1) * (P_res+P_start - P_start*P_res)
-        if n+1>=minN-1>=0:
-            Pd_plus += math.comb(n+1,minN-1) * P_oneW**(minN-1) * (1-P_oneW)**(n+1-minN+1) * (P_res+P_start - P_start*P_res)
-
-        Pd_total += (Pn*Pd + Pn_minus*Pd_minus + Pn_plus*Pd_plus) / (Pn+Pn_minus+Pn_plus)
-
-        cnt += 1
-
-    return Pd_total/cnt
-
-def compute_disc_from_lat(A, nb, C, E, psiGap, lat=0, window=0, W_base=0):
-
-    if lat<B:
+# when there is k complete windows, what is the capture probability
+def func_Pd(Pd_one, minN, k, frac_single=0, frac_both=0): 
+    if k<minN-1:
         return 0
     
-    k = math.floor(lat / E)
-    leftover = lat - k * E
-    fraction = (leftover / E)
+    Pd = 0
+    for n_disc in range(minN, k+1):
+        n_nd = k-n_disc # number of window that is not discovered
+        P_dics = Pd_one**(n_disc)
+        P_not_dics = (1-Pd_one)**n_nd
+        Pd += math.comb(k, n_disc) * (P_dics) * (P_not_dics)
+    
+    # frac
+    if minN-1>=0:
+        n_disc = minN-1
+        P_dics = Pd_one**n_disc
+        P_not_dics = (1-Pd_one)**(k-n_disc)
+        Pd += math.comb(k, n_disc) * (P_dics) * (P_not_dics) * (frac_single-frac_both)*Pd_one
 
-    psi = W_base/2
+    return Pd
+
+def compute_disc_prob(A, nb, C, minN, W_base, latency):
+    window = W_base + W_base/2  #0~W_base
+    
+    # only 2/3 function
+    func = 2/3 
+    non_func = 1/3
 
     # Extended
     Base = (2 * B)
-    Pc_before = ((L_Scan-B) - B/2) / (L_Scan-B) * (B - b) / Base ### different from BLEnd
+    Pc_before = ((L_Scan-B) - B/2) / (L_Scan-B) * (B - b) / Base 
     Pc_primary = (2 * b) / Base
     Pc_second = max(0, b_sec - b) / Base / 37  # there are 37 secondary channels
     Pc_internal = (Pc_before + Pc_primary + Pc_second)
     
-    P_over = 2*B/A 
-    P_over = P_over*Pc_internal
-    gamma = (1-psi/window) * (C-2)
+    P_over = func * 2*B/A
+    P_c = P_over*Pc_internal
     
-    Pnc = (1-P_over) ** gamma
+    # gamma = func * (C-2)
+    P_in = (1 - non_func) * (1-2*B/A)
+    gamma = (C-2)
+    
+    Pnc = (1-P_c) ** gamma
+    Pd_one = P_in * Pnc
 
-    if k>=1:
-        P_in = (1-psi/window) * (1-(2*B)/A)
-        Pd = P_in * Pnc
-    else:
-        P_in  = max(0, (1-psi/window) * (fraction*L_Scan-B)/A)
-        Pd = P_in * Pnc
-
-    return Pd
+    maxK = latency // W_base
+    minK = max(0, latency//(2*W_base) -1) #  minK-1 !
+    W = 0
+    P = 0
+    for i in range(minK, maxK+1):
+        prob_k, frac_single, frac_both = combK(latency - W_base*i , i, W_base, Pd_one)
+        P_k = func_Pd(Pd_one, minN, i, frac_single, frac_both) 
+        P += P_k * prob_k
+        W += prob_k
+        
+    return P/W if W else 0 ## sumW==1
 
 
 for n_chunk in n_chunk_list:
@@ -154,7 +220,7 @@ for n_chunk in n_chunk_list:
         for latency in latency_list:
             
             # Write results to output file
-            out_file_name = f"/Users/hy.c/Desktop/NoD_Plus/BLEndAE/ExtendedAE_nihao_{sla_prob}_{latency/1000}s_{n_chunk}chunk_log.txt"
+            out_file_name = f"./[Nihao Extended+AE] Final Result/Nihao ExtendedAE Results/ExtendedAE_nihao_{sla_prob}_{latency/1000}s_{n_chunk}chunk_log.txt"
 
             with open(out_file_name, 'w') as con:
 
@@ -171,40 +237,28 @@ for n_chunk in n_chunk_list:
                     Q_min = np.iinfo(np.int32).max
                     I_min = np.iinfo(np.int32).max
 
-                    for A in range(100, 101):
-
-                        L_Scan = A - B 
-                        minN = math.floor(0.8 * n_chunk) + (1 if n_chunk * 0.8 % 1 > 0 else 0)  # minimum number of windows that needs to be captured
+                    minN = n_chunk
+                    
+                    max_n_slot = int(latency / A)
+                    for n_slot in range(max_n_slot, 0, -1):
+                        W_base = n_slot * A
+                        advCnt = n_slot
                         
-                        for W_base in range(int(latency / (2 * minN + 1)), int(4 * A), -1): # make sure there are enough complete windows
-                            
-                            if W_base%A!=0: continue
+                        disc_prob = compute_disc_prob(A, advCnt, sla_nodes, minN, W_base, latency)
 
-                            n_slot = W_base//A 
-                            E = n_slot*A
-
-                            if W_base < E:
-                                break
-
-                            advTime = E - L_Scan
-                            psiGap = advTime % (A + max_slop / 2)  # use for BLE to determine last size
-                            advCnt = n_slot
-                            
-                            disc_prob = compute_disc_prob(A, 0, E, advCnt, sla_nodes, psiGap, minN, W_base, latency)
-
-                            if disc_prob >= sla_prob:
-                                Q = compute_Q(A, advCnt, psiGap, E)
-                                I = Q / E
-                                if I < I_min:
-                                    I_min = I
-                                    Q_min = Q
-                                    epoch_best = E
-                                    disc_best = disc_prob
-                                    bestA = A
-                                    bestNb = advCnt
-                                    bestW = W_base
-                                    bestN = n_slot
-                                    N_window = n
+                        if disc_prob >= sla_prob:
+                            Q = compute_Q(A, advCnt, W_base)
+                            I = Q
+                            if I < I_min:
+                                I_min = I
+                                Q_min = Q
+                                epoch_best = W_base
+                                disc_best = disc_prob
+                                bestA = A
+                                bestNb = advCnt
+                                bestW = W_base
+                                bestN = n_slot
+                                N_window = n
 
                     # Write results to the file
                     con.write(f"\nThe best epoch size for {sla_nodes} nodes is {epoch_best}\n")
